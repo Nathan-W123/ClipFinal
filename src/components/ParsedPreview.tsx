@@ -3,7 +3,7 @@
 
 import React from 'react';
 import { View, Text, ScrollView, Pressable, StyleSheet } from 'react-native';
-import type { ParseResult } from '../voice/cactus';
+import type { ParseIssue, ParseResult } from '../voice/cactus';
 import type { Template, FieldDefinition } from '../core/schemas';
 
 interface Props {
@@ -15,14 +15,24 @@ interface Props {
 
 export function ParsedPreview({ result, template, onConfirm, onDiscard }: Props) {
   const { record, confidence, latencyMs } = result;
+  const issues: ParseIssue[] = result.issues ?? [];
+  const hasErrors = issues.some(i => i.severity === 'error');
   const confidencePct = Math.round(confidence * 100);
   const isLowConfidence = confidence < 0.7;
+
   const payloadForDisplay: Record<string, unknown> =
     record.payload !== null &&
     typeof record.payload === 'object' &&
     !Array.isArray(record.payload)
       ? (record.payload as Record<string, unknown>)
       : { value: String(record.payload) };
+
+  // Show only the fields sub-object for database_entry payloads.
+  const fieldsToDisplay: Record<string, unknown> =
+    (payloadForDisplay as { kind?: string; fields?: Record<string, unknown> }).kind === 'database_entry' &&
+    typeof (payloadForDisplay as { fields?: unknown }).fields === 'object'
+      ? ((payloadForDisplay as { fields: Record<string, unknown> }).fields)
+      : payloadForDisplay;
 
   const fieldLabels: Record<string, string> =
     template.type === 'database_entry'
@@ -42,22 +52,43 @@ export function ParsedPreview({ result, template, onConfirm, onDiscard }: Props)
         </View>
       </View>
 
-      {isLowConfidence && (
-        <View style={styles.warning}>
+      {isLowConfidence && issues.every(i => i.code !== 'low_confidence') && (
+        <View style={styles.warningBox}>
           <Text style={styles.warningText}>
             Low confidence — review carefully before saving
           </Text>
         </View>
       )}
 
+      {/* Parse issues panel */}
+      {issues.length > 0 && (
+        <View style={styles.issuesList}>
+          {issues.map((issue, idx) => (
+            <View
+              key={idx}
+              style={[styles.issueRow, issue.severity === 'error' ? styles.issueError : styles.issueWarning]}
+            >
+              <Text style={[styles.issueIcon, issue.severity === 'error' ? styles.issueIconError : styles.issueIconWarning]}>
+                {issue.severity === 'error' ? '!' : '~'}
+              </Text>
+              <Text style={[styles.issueText, issue.severity === 'error' ? styles.issueTextError : styles.issueTextWarning]}>
+                {issue.field ? `[${issue.field}] ` : ''}{issue.message}
+              </Text>
+            </View>
+          ))}
+        </View>
+      )}
+
       <ScrollView style={styles.fields} contentContainerStyle={styles.fieldsInner}>
-        {Object.entries(payloadForDisplay).map(([key, value]) => (
+        {Object.entries(fieldsToDisplay).map(([key, value]) => (
           <View key={key} style={styles.row}>
             <Text style={styles.fieldKey}>{fieldLabels[key] ?? key}</Text>
-            <Text style={styles.fieldValue}>
-              {typeof value === 'object' && value !== null
-                ? JSON.stringify(value)
-                : String(value)}
+            <Text style={[styles.fieldValue, value === null && styles.fieldValueNull]}>
+              {value === null || value === undefined
+                ? '—'
+                : typeof value === 'object'
+                  ? JSON.stringify(value)
+                  : String(value)}
             </Text>
           </View>
         ))}
@@ -74,8 +105,14 @@ export function ParsedPreview({ result, template, onConfirm, onDiscard }: Props)
         <Pressable style={styles.discardBtn} onPress={onDiscard}>
           <Text style={styles.discardText}>Discard</Text>
         </Pressable>
-        <Pressable style={styles.confirmBtn} onPress={onConfirm}>
-          <Text style={styles.confirmText}>Save</Text>
+        <Pressable
+          style={[styles.confirmBtn, hasErrors && styles.confirmBtnDisabled]}
+          onPress={hasErrors ? undefined : onConfirm}
+          disabled={hasErrors}
+        >
+          <Text style={styles.confirmText}>
+            {hasErrors ? 'Fix issues to save' : 'Save'}
+          </Text>
         </Pressable>
       </View>
     </View>
@@ -116,7 +153,7 @@ const styles = StyleSheet.create({
   badgeTextLow: {
     color: '#E65100',
   },
-  warning: {
+  warningBox: {
     backgroundColor: '#FFF3E0',
     borderRadius: 8,
     padding: 12,
@@ -124,6 +161,46 @@ const styles = StyleSheet.create({
   warningText: {
     fontSize: 13,
     color: '#E65100',
+  },
+  issuesList: {
+    gap: 6,
+  },
+  issueRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    gap: 8,
+  },
+  issueError: {
+    backgroundColor: '#FFEBEE',
+  },
+  issueWarning: {
+    backgroundColor: '#FFF8E1',
+  },
+  issueIcon: {
+    fontSize: 13,
+    fontWeight: '700',
+    width: 16,
+    textAlign: 'center',
+  },
+  issueIconError: {
+    color: '#C62828',
+  },
+  issueIconWarning: {
+    color: '#E65100',
+  },
+  issueText: {
+    fontSize: 12,
+    flex: 1,
+    lineHeight: 18,
+  },
+  issueTextError: {
+    color: '#C62828',
+  },
+  issueTextWarning: {
+    color: '#BF360C',
   },
   fields: {
     flex: 1,
@@ -150,6 +227,10 @@ const styles = StyleSheet.create({
     color: '#111',
     flex: 2,
     textAlign: 'right',
+  },
+  fieldValueNull: {
+    color: '#CCC',
+    fontWeight: '400',
   },
   transcript: {
     gap: 4,
@@ -197,6 +278,9 @@ const styles = StyleSheet.create({
     backgroundColor: '#000',
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  confirmBtnDisabled: {
+    backgroundColor: '#BDBDBD',
   },
   confirmText: {
     fontSize: 15,

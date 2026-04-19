@@ -1,6 +1,7 @@
 import type { Template } from './schemas';
 import type { ParsedPayload } from './payloadValidation';
 import { getLearnedSchemaSnapshot } from '../services/schemaLearning';
+import { WORD_NUM, SPOKEN_NUM_WORDS, parseSpokenInt as sharedParseSpokenInt } from '../voice/spokenNumbers';
 
 /** Match template rows (including SQLite) when id omits `master-` prefix. */
 function inferMasterSchemaId(template: Template): string | null {
@@ -36,43 +37,11 @@ export function applyMasterEnrichmentIfNeeded(
   return enrichParsedPayloadForMaster(schemaId, transcript.trim(), payload);
 }
 
-const WORD_NUM: Record<string, number> = {
-  zero: 0,
-  one: 1,
-  two: 2,
-  three: 3,
-  four: 4,
-  five: 5,
-  six: 6,
-  seven: 7,
-  eight: 8,
-  nine: 9,
-  ten: 10,
-  eleven: 11,
-  twelve: 12,
-  thirteen: 13,
-  fourteen: 14,
-  fifteen: 15,
-  sixteen: 16,
-  seventeen: 17,
-  eighteen: 18,
-  nineteen: 19,
-  twenty: 20,
-};
-
-const SPOKEN_NUM_WORDS = Object.keys(WORD_NUM)
-  .filter(k => k !== 'zero')
-  .join('|');
-
-function parseSpokenInt(token: string): number | null {
-  const t = token.trim().toLowerCase();
-  if (/^\d+$/.test(t)) {
-    const n = parseInt(t, 10);
-    return Number.isFinite(n) ? n : null;
-  }
-  const w = WORD_NUM[t];
-  return w !== undefined ? w : null;
-}
+// WORD_NUM, SPOKEN_NUM_WORDS, and parseSpokenInt are now shared from src/voice/spokenNumbers.ts.
+// The aliases below keep the local call sites unchanged.
+const parseSpokenInt = sharedParseSpokenInt;
+// Re-export so any callers that imported these directly still compile.
+export { WORD_NUM, SPOKEN_NUM_WORDS };
 
 /**
  * Fills `database_entry.fields` from transcript when the LM missed values.

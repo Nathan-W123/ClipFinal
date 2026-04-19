@@ -8,12 +8,14 @@ import React, {
 } from 'react';
 import { Platform } from 'react-native';
 import { useCactusLM } from 'cactus-react-native';
-import type { Template } from '../core/schemas';
+import type { FieldSemanticRole, Template } from '../core/schemas';
 import { applyMasterEnrichmentIfNeeded } from '../core/enrichMasterPayload';
 import { fallbackPayload, validateParsedPayload } from '../core/payloadValidation';
 import { transcribeAudioFile } from '../services/transcribe';
 import { getLearnedSchemaSnapshot } from '../services/schemaLearning';
-import type { ParseResult } from './cactus';
+import { buildPriorityOrderedFields, normalizeLmResult } from './parserNormalization';
+import { WORD_NUM } from './spokenNumbers';
+import type { ParseIssue, ParseResult } from './cactus';
 
 const MODEL_ID =
   process.env.EXPO_PUBLIC_CACTUS_MODEL ?? 'google/gemma-4-E2B-it';
@@ -43,62 +45,72 @@ Use short titles for steps inferred from the transcript.`;
 {"kind":"notes","body":"string","title":"optional string"}
 Put the main content in body.`;
     case 'database_entry': {
-      if (template.id === 'master-dolphin_observations') {
-        return `Return ONLY one JSON object (no markdown, no prose).
-Examples:
-Transcript "6 dolphins spotted near location 12"
-→ {"kind":"database_entry","fields":{"observation_type":"dolphin","dolphin_count":6,"location":"12","buoy":null}}
-
-Transcript "pod of 4 spotted near location 1"
-→ {"kind":"database_entry","fields":{"observation_type":"dolphin","dolphin_count":4,"location":"1","buoy":null}}
-
-Rules:
-- Keys MUST be exactly: observation_type, dolphin_count, location, buoy.
-- dolphin_count: integer (from "6 dolphins", "pod of 4", etc.).
-- location: digits after the word "location" (e.g. location 12 → "12").
-- buoy: digits after "buoy" if spoken; else null.
-- observation_type: "dolphin" when dolphins/pods are described.`;
-      }
-      if (
-        template.id === 'master-costco_inventory' ||
-        template.id.endsWith('-costco_inventory')
-      ) {
-        return `Return ONLY one JSON object (no markdown, no prose).
-Examples:
-Transcript "brand Kirkland Signature type toilet paper count 12"
-→ {"kind":"database_entry","fields":{"brand":"Kirkland Signature","product_type":"toilet paper","product_name":null,"quantity":12}}
-
-Transcript "Charmin ultra soft quantity three"
-→ {"kind":"database_entry","fields":{"brand":"Charmin","product_type":"toilet paper","product_name":"ultra soft","quantity":3}}
-
-Transcript "count five Kirkland frozen berries"
-→ {"kind":"database_entry","fields":{"brand":"Kirkland","product_type":"frozen","product_name":"berries","quantity":5}}
-
-Rules:
-- Keys MUST be exactly: brand, product_type, product_name, quantity (snake_case).
-- quantity: integer only. Map spoken numbers to integers (one→1, two→2, three→3, … twenty→20).
-- brand: manufacturer or Kirkland-style label spoken after "brand" or at start (e.g. Kirkland Signature, Charmin).
-- product_type: category (toilet paper, chicken, beverages, snacks, frozen, …).
-- product_name: specific line/SKU if stated after "called", "product name", or mid-phrase; else null.
-Never leave fields empty objects; use null only when truly unknown.`;
-      }
       const defs = template.schemaDefinition ?? [];
-      if (defs.length > 0) {
-        const inner = defs
-          .map(f => {
-            const t = f.valueType ? ` [type: ${f.valueType}]` : '';
-            return `    "${f.key}": <${f.label}>${t}  // column "${f.key}"`;
-          })
-          .join(',\n');
-        return `Return a single JSON object only. Keys MUST match these database column names exactly:
-{"kind":"database_entry","fields":{
-${inner}
-}}
-Use JSON numbers for integer/real fields, booleans where appropriate, strings for text. Use null only when unknown.`;
-      }
-      return `Return a single JSON object only:
+      if (defs.length === 0) {
+        return `Return a single JSON object only:
 {"kind":"database_entry","fields":{"key":"value",...}}
 Use string values unless clearly numeric or boolean.`;
+      }
+
+      // Order fields by parsePriority / semantic role so quantity fields appear first.
+      const ordered = buildPriorityOrderedFields(defs);
+
+      const spokeNumMap = Object.entries(WORD_NUM)
+        .filter(([k]) => k !== 'zero')
+        .map(([k, v]) => `${k}=${v}`)
+        .join(', ');
+
+      const fieldLines = ordered.map(f => {
+        const typeHint = f.valueType ? ` [${f.valueType}]` : '';
+        const parts: string[] = [`  "${f.key}"${typeHint}: <${f.label}>`];
+        if (f.parser?.description) parts.push(`  // ${f.parser.description}`);
+        if (f.parser?.aliases?.length) parts.push(`  // aliases: ${f.parser.aliases.join(', ')}`);
+        if (f.parser?.examples?.length) parts.push(`  // e.g. ${f.parser.examples.join(', ')}`);
+        return parts.join('\n');
+      });
+
+      // Generate dynamic few-shot examples for quantity + brand + product role groups.
+      const quantityDef = ordered.find(f => f.parser?.semanticRole === 'quantity');
+      const brandDef    = ordered.find(f => f.parser?.semanticRole === ('brand' as FieldSemanticRole));
+      const ptDef       = ordered.find(f => f.parser?.semanticRole === ('product_type' as FieldSemanticRole));
+      const pnDef       = ordered.find(f => f.parser?.semanticRole === ('product_name' as FieldSemanticRole));
+
+      let fewShot = '';
+      if (quantityDef && brandDef && ptDef) {
+        const qk = quantityDef.key;
+        const bk = brandDef.key;
+        const tk = ptDef.key;
+        const pk = pnDef?.key ?? null;
+        const nullPn = pk ? `,"${pk}":null` : '';
+        const nullPt = pk ? `,"${tk}":null` : '';
+
+        fewShot = `
+Examples (always use exact snake_case field keys — never use label names as keys):
+Input: "three Kirkland Signature chickens"
+→ {"kind":"database_entry","fields":{"${qk}":3,"${bk}":"Kirkland Signature","${tk}":"chickens"${nullPn}}}
+
+Input: "I see twelve Charmin ultra soft"
+→ {"kind":"database_entry","fields":{"${qk}":12,"${bk}":"Charmin"${nullPt}${pk ? `,"${pk}":"ultra soft"` : ''}}}
+
+Input: "brand Kirkland Signature type toilet paper count 24"
+→ {"kind":"database_entry","fields":{"${qk}":24,"${bk}":"Kirkland Signature","${tk}":"toilet paper"${nullPn}}}
+
+Critical rules:
+- A spoken number immediately before or after a product phrase is ALWAYS "${qk}", even if "${qk}" appears last in the schema.
+- NEVER put a number in "${bk}" or "${tk}".
+- Spoken numbers: ${spokeNumMap}.
+`;
+      } else if (quantityDef) {
+        fewShot = `\nCritical rule: A spoken number referring to a count is ALWAYS "${quantityDef.key}". Spoken numbers: ${spokeNumMap}.\n`;
+      }
+
+      return `Return ONLY one JSON object (no markdown, no prose).
+${fewShot}
+Schema — use these exact key names:
+{"kind":"database_entry","fields":{
+${fieldLines.join(',\n')}
+}}
+Use JSON numbers for integer/real fields. Use null when a value is truly unknown.`;
     }
     default:
       return '{"kind":"notes","body":"string"}';
@@ -204,6 +216,7 @@ Rules: Output ONLY the JSON object. No markdown, no commentary.`;
             },
             confidence: 0.22,
             latencyMs: result.totalTimeMs ?? 0,
+            issues: [],
           };
         }
         const jsonText = extractJsonObject(result.response);
@@ -221,18 +234,45 @@ Rules: Output ONLY the JSON object. No markdown, no commentary.`;
             },
             confidence: 0.4,
             latencyMs: 0,
+            issues: [],
           };
         }
 
         const v = validateParsedPayload(template, parsed);
         let payload = v.ok ? v.payload : fallbackPayload(template, trimmed);
+        const issues: ParseIssue[] = [];
+
+        // Run the normalization layer for database_entry templates.
+        if (v.ok && v.payload.kind === 'database_entry' && template.type === 'database_entry') {
+          const rawFields = v.payload.fields as Record<string, unknown>;
+          const { fields: normalizedFields, issues: normIssues } = normalizeLmResult(
+            template,
+            rawFields,
+            trimmed,
+          );
+          issues.push(...normIssues);
+          payload = { kind: 'database_entry', fields: normalizedFields };
+        }
+
+        // Enrichment fills remaining null fields; normalization handled the primary cases.
         payload = applyMasterEnrichmentIfNeeded(template, trimmed, payload);
+
         const modelConf =
           typeof result.confidence === 'number' && !Number.isNaN(result.confidence)
             ? result.confidence
             : v.ok
               ? 0.88
               : 0.45;
+
+        if (modelConf < 0.7) {
+          issues.push({
+            field: '',
+            severity: 'warning',
+            code: 'low_confidence',
+            message: `Model confidence ${Math.round(modelConf * 100)}% — review carefully`,
+          });
+        }
+
         return {
           record: {
             templateId: template.id,
@@ -242,6 +282,7 @@ Rules: Output ONLY the JSON object. No markdown, no commentary.`;
           },
           confidence: modelConf,
           latencyMs: result.totalTimeMs ?? 0,
+          issues,
         };
       } catch {
         const fb = applyMasterEnrichmentIfNeeded(template, trimmed, fallbackPayload(template, trimmed));
@@ -254,6 +295,7 @@ Rules: Output ONLY the JSON object. No markdown, no commentary.`;
           },
           confidence: 0.35,
           latencyMs: 0,
+          issues: [],
         };
       }
     },

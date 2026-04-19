@@ -29,6 +29,7 @@ function fieldsToJson(fields: MasterField[]): string {
     key: f.key,
     label: f.label,
     valueType: f.valueType,
+    parser: f.parser,
   }));
   return JSON.stringify(defs);
 }
@@ -44,11 +45,23 @@ function rowToTemplate(row: TemplateSchemaRow): Template | null {
   if (kind === 'database_entry') {
     try {
       const defs = JSON.parse(row.fields_json) as FieldDefinition[];
+      const schemaDefinition = Array.isArray(defs) ? defs : [];
+      // Re-inject parser hints from the local master registry so Supabase syncs
+      // (which don't include parser hints) don't lose semantic metadata.
+      if (row.master_schema_id) {
+        const master = getMasterSchema(row.master_schema_id);
+        if (master) {
+          const hintMap = new Map(master.fields.map(f => [f.key, f.parser]));
+          for (const def of schemaDefinition) {
+            if (!def.parser) def.parser = hintMap.get(def.key);
+          }
+        }
+      }
       return {
         id: row.id,
         name: row.display_name,
         type: 'database_entry',
-        schemaDefinition: Array.isArray(defs) ? defs : [],
+        schemaDefinition,
       };
     } catch {
       return {
